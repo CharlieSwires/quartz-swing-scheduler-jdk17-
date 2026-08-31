@@ -23,7 +23,6 @@ set -euo pipefail
 MONGO_URI="mongodb+srv://uname:pw@cluster0.icebq.mongodb.net/example_security"
 PATH="C:\Users\charl\Downloads\mongodb-database-tools-windows-x86_64-100.18.0/mongodb-database-tools-windows-x86_64-100.18.0\bin":$PATH
 echo "PATH=${PATH}"
-: "${MONGO_URI:?ERROR: MONGO_URI environment variable is not set.}"
 
 DATE="$(date +%Y-%m-%d)"
 
