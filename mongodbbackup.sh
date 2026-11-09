@@ -20,7 +20,7 @@ set -euo pipefail
 # ============================================================
 
 # ---- Configuration ----
-MONGO_URI="mongodb+srv://uname:pw@cluster0.icebq.mongodb.net/example_security"
+MONGO_URI="${MONGO_URI:?MONGO_URI must be set}"
 PATH="C:\Users\charl\Downloads\mongodb-database-tools-windows-x86_64-100.18.0/mongodb-database-tools-windows-x86_64-100.18.0\bin":$PATH
 echo "PATH=${PATH}"
 
