@@ -1,178 +1,148 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# MongoDB Atlas/local backup rotation script
-#
-# Creates:
-#   ~/backupYYYY-MM-DD
-#
-# Then rotates:
-#   daily   -> weekly  after 7 days
-#   weekly  -> monthly after 4 weeklies
-#   monthly -> yearly  after 12 monthlies
-#
-# Required environment variable:
-#   MONGO_URI
-#
-# Example:
-#   export MONGO_URI='mongodb+srv://user:password@cluster.xxxxx.mongodb.net/example_security'
-# ============================================================
+# Successful daily backups drive the schedule: days 8, 15, 22, ...;
+# scheduled weeks 5, 9, 13, ...; scheduled months 13, 25, 37, ...
+# Existing directories from before this script's first run are kept as legacy
+# archives. The new sequence starts at zero; gaps and failed dumps don't count.
+# Keep .mongodb-backup-rotation.state with the backup directories.
 
-# ---- Configuration ----
-MONGO_URI="${MONGO_URI:?MONGO_URI must be set}"
-PATH="C:\Users\charl\Downloads\mongodb-database-tools-windows-x86_64-100.18.0/mongodb-database-tools-windows-x86_64-100.18.0\bin":$PATH
-echo "PATH=${PATH}"
+root="${MONGO_BACKUP_ROOT:-$HOME}"
+# Use the existing Git Bash tools installation if needed; PATH takes precedence.
+tools_dir="${MONGODB_TOOLS_BIN:-/c/Users/charl/Downloads/mongodb-database-tools-windows-x86_64-100.18.0/mongodb-database-tools-windows-x86_64-100.18.0/bin}"
+if [[ -d "$tools_dir" ]]; then export PATH="$PATH:$tools_dir"; fi
 
-DATE="$(date +%Y-%m-%d)"
+mkdir -p -- "$root"
+root="$(cd -- "$root" && pwd -P)"
+today="$(date +%Y-%m-%d)"
+state="$root/.mongodb-backup-rotation.state"
+lock="$root/.mongodb-backup-rotation.lock"
+stage="$root/.mongodb-backup-in-progress"
+log_file="$root/mongodb-backup-rotation.log"
+day_pattern='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+shopt -s nullglob
 
-DAILY_PREFIX="$HOME/backup"
-WEEKLY_PREFIX="$HOME/backupweekly"
-MONTHLY_PREFIX="$HOME/backupmonthly"
-YEARLY_PREFIX="$HOME/backupyearly"
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$log_file"; }
+fail() { log "ERROR: $*"; exit 1; }
+exists() { [[ -e "$1" || -L "$1" ]]; }
 
-TODAY_BACKUP="${DAILY_PREFIX}${DATE}"
+mkdir -- "$lock" 2>/dev/null || fail "Backup is locked. If no backup is running, remove the empty lock directory: $lock"
+trap 'rmdir -- "$lock"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-LOG_FILE="$HOME/mongodb-backup-rotation.log"
-
-# ---- Logging ----
-
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+write_state() {
+    # Rename from the same filesystem so readers always see a complete record.
+    printf '%s %s %s %s\n' "$1" "$2" "$cutoff" "$3" > "$state.tmp"
+    mv -fT -- "$state.tmp" "$state"
 }
 
-# ---- Safety checks ----
+# list_tier sets a sorted array; strict file names and no symlinks.
+export LC_ALL=C
+list_tier() {
+    local prefix="$1" path stamp
+    tier=()
+    for path in "$root/$prefix"$day_pattern; do
+        [[ -d "$path" && ! -L "$path" ]] || continue
+        stamp="${path##*/$prefix}"
+        if [[ "$stamp" > "$cutoff" ]]; then tier+=("$path"); fi
+    done
+}
 
-if ! command -v mongodump >/dev/null 2>&1; then
-    log "ERROR: mongodump was not found on PATH."
-    log "Install MongoDB Database Tools and make sure mongodump is available."
-    exit 1
+if [[ ! -f "$state" ]]; then
+    exists "$stage" && fail "Found an in-progress dump without its state file: $stage"
+    cutoff=0000-00-00
+    # A cutoff preserves old backups without assuming their count or cadence.
+    for prefix in backup backupweekly backupmonthly backupyearly; do
+        for path in "$root/$prefix"$day_pattern; do
+            [[ -d "$path" && ! -L "$path" ]] || continue
+            stamp="${path##*/$prefix}"
+            if [[ "$stamp" > "$cutoff" ]]; then cutoff="$stamp"; fi
+        done
+    done
+    write_state 0 - done
+    log "Started a new rotation tally. Existing archives through $cutoff are kept separately."
 fi
 
-# Avoid overwriting an existing backup from the same day.
-if [ -e "$TODAY_BACKUP" ]; then
-    log "ERROR: Today's backup already exists: $TODAY_BACKUP"
-    log "Not overwriting it."
-    exit 1
-fi
+read -r total last cutoff phase < "$state" || fail "Cannot read rotation state: $state"
+[[ "$total" =~ ^(0|[1-9][0-9]{0,8})$ && "$cutoff" == $day_pattern &&
+    ( "$last" == - || "$last" == $day_pattern ) &&
+    ( "$phase" == done || ( "$phase" == pending && "$last" != - && "$total" != 0 ) ) ]] ||
+    fail "Invalid rotation state: $state"
 
-# ---- Create today's daily backup ----
-
-log "Starting MongoDB backup."
-log "Output directory: $TODAY_BACKUP"
-
-mongodump --uri "$MONGO_URI" --out "$TODAY_BACKUP"
-
-log "Backup completed: $TODAY_BACKUP"
-
-# ---- Helper: list matching backup directories oldest first ----
-
-list_dirs_oldest_first() {
-    local prefix="$1"
-
-    # Finds directories like:
-    #   /home/user/backup2026-06-17
-    #   /home/user/backupweekly2026-06-17
-    #
-    # Then sorts by name, which works because YYYY-MM-DD sorts chronologically.
-    find "$HOME" -maxdepth 1 -type d -name "$(basename "$prefix")????-??-??" | sort
+rotate_tier() {
+    local from="$1" to="$2" cap="$3" promote="$4" oldest target
+    list_tier "$from"
+    while (( ${#tier[@]} > cap )); do
+        oldest="${tier[0]}"
+        if (( promote )); then
+            target="$root/$to${oldest##*/$from}"
+            exists "$target" && fail "Archive already exists; both backups left untouched: $target"
+            mv -T -- "$oldest" "$target"
+            log "Promoted: $oldest -> $target"
+            promote=0
+        else
+            rm -rf -- "$oldest"
+            log "Expired from rolling retention: $oldest"
+        fi
+        list_tier "$from"
+    done
 }
 
-count_dirs() {
-    local prefix="$1"
-    list_dirs_oldest_first "$prefix" | wc -l | tr -d ' '
-}
-
-oldest_dir() {
-    local prefix="$1"
-    list_dirs_oldest_first "$prefix" | head -n 1
-}
-
-# ---- Rotate daily -> weekly ----
-#
-# After creating today's backup, if there are more than 7 daily backups,
-# move the oldest daily backup into weekly storage.
-
-daily_count="$(count_dirs "$DAILY_PREFIX")"
-
-if [ "$daily_count" -gt 7 ]; then
-    oldest_daily="$(oldest_dir "$DAILY_PREFIX")"
-    oldest_date="${oldest_daily#$DAILY_PREFIX}"
-    weekly_target="${WEEKLY_PREFIX}${oldest_date}"
-
-    log "Daily backups count is $daily_count, moving oldest daily to weekly:"
-    log "  $oldest_daily"
-    log "  -> $weekly_target"
-
-    if [ -e "$weekly_target" ]; then
-        log "WARNING: Weekly target already exists, deleting old daily instead:"
-        log "  $oldest_daily"
-        rm -rf "$oldest_daily"
+finish_pending() {
+    local final="$root/backup$last" weekly=0 monthly=0 yearly=0 week month
+    if exists "$stage"; then
+        exists "$final" && fail "Both staged and final backups exist; neither was overwritten."
+        [[ -d "$stage" && ! -L "$stage" ]] || fail "Invalid staged backup: $stage"
+        mv -T -- "$stage" "$final"
     else
-        mv "$oldest_daily" "$weekly_target"
+        [[ -d "$final" && ! -L "$final" ]] || fail "Pending backup is missing: $final"
     fi
-else
-    log "Daily backups count is $daily_count, no daily rotation needed."
+    if (( total >= 8 && (total - 8) % 7 == 0 )); then
+        weekly=1
+        week=$((1 + (total - 8) / 7))
+        if (( week >= 5 && (week - 5) % 4 == 0 )); then
+            monthly=1
+            month=$((1 + (week - 5) / 4))
+            if (( month >= 13 && (month - 13) % 12 == 0 )); then yearly=1; fi
+        fi
+    fi
+    rotate_tier backup backupweekly 7 "$weekly"
+    rotate_tier backupweekly backupmonthly 4 "$monthly"
+    rotate_tier backupmonthly backupyearly 12 "$yearly"
+    # Yearlies are never pruned. Keep the all-time daily tally as well.
+    write_state "$total" "$last" done
+    log "Backup rotation finished. Successful daily backups in this sequence: $total"
+}
+
+if [[ "$phase" == pending ]]; then
+    log "Resuming unfinished rotation for $last."
+    finish_pending
 fi
 
-# ---- Rotate weekly -> monthly ----
-#
-# If there are more than 4 weekly backups,
-# move the oldest weekly backup into monthly storage.
+if [[ "$today" == "$last" || ( "$last" == - && -d "$root/backup$today" ) ]]; then
+    log "Today's backup already exists; the tally was not incremented."
+    exit 0
+fi
+[[ "$today" > "$cutoff" && "$today" > "$last" ]] || fail "Backup date is earlier than the rotation sequence."
+exists "$root/backup$today" && fail "Today's backup path already exists: $root/backup$today"
+command -v mongodump >/dev/null 2>&1 || fail "mongodump was not found on PATH."
+: "${MONGO_URI:?MONGO_URI must be set}"
 
-weekly_count="$(count_dirs "$WEEKLY_PREFIX")"
-
-if [ "$weekly_count" -gt 4 ]; then
-    oldest_weekly="$(oldest_dir "$WEEKLY_PREFIX")"
-    oldest_date="${oldest_weekly#$WEEKLY_PREFIX}"
-    monthly_target="${MONTHLY_PREFIX}${oldest_date}"
-
-    log "Weekly backups count is $weekly_count, moving oldest weekly to monthly:"
-    log "  $oldest_weekly"
-    log "  -> $monthly_target"
-
-    if [ -e "$monthly_target" ]; then
-        log "WARNING: Monthly target already exists, deleting old weekly instead:"
-        log "  $oldest_weekly"
-        rm -rf "$oldest_weekly"
-    else
-        mv "$oldest_weekly" "$monthly_target"
-    fi
-else
-    log "Weekly backups count is $weekly_count, no weekly rotation needed."
+# A leftover stage with no pending record belongs to an incomplete dump.
+if exists "$stage"; then
+    [[ -d "$stage" && ! -L "$stage" ]] || fail "Unexpected staging path: $stage"
+    rm -rf -- "$stage"
+fi
+mkdir -- "$stage"
+log "Starting MongoDB backup for $today."
+if ! mongodump --uri "$MONGO_URI" --out "$stage"; then
+    rm -rf -- "$stage"
+    fail "mongodump failed; no backup counted or rotated."
 fi
 
-# ---- Rotate monthly -> yearly ----
-#
-# If there are more than 12 monthly backups,
-# move the oldest monthly backup into yearly storage.
-
-monthly_count="$(count_dirs "$MONTHLY_PREFIX")"
-
-if [ "$monthly_count" -gt 12 ]; then
-    oldest_monthly="$(oldest_dir "$MONTHLY_PREFIX")"
-    oldest_date="${oldest_monthly#$MONTHLY_PREFIX}"
-    yearly_target="${YEARLY_PREFIX}${oldest_date}"
-
-    log "Monthly backups count is $monthly_count, moving oldest monthly to yearly:"
-    log "  $oldest_monthly"
-    log "  -> $yearly_target"
-
-    if [ -e "$yearly_target" ]; then
-        log "WARNING: Yearly target already exists, deleting old monthly instead:"
-        log "  $oldest_monthly"
-        rm -rf "$oldest_monthly"
-    else
-        mv "$oldest_monthly" "$yearly_target"
-    fi
-else
-    log "Monthly backups count is $monthly_count, no monthly rotation needed."
-fi
-
-log "Backup rotation finished."
-
-log "Current backup counts:"
-log "  Daily:   $(count_dirs "$DAILY_PREFIX")"
-log "  Weekly:  $(count_dirs "$WEEKLY_PREFIX")"
-log "  Monthly: $(count_dirs "$MONTHLY_PREFIX")"
-log "  Yearly:  $(count_dirs "$YEARLY_PREFIX")"
+total=$((total + 1))
+last="$today"
+write_state "$total" "$last" pending
+finish_pending
+log "Backup completed: $root/backup$today"
